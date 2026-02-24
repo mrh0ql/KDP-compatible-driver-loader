@@ -83,7 +83,8 @@ ULONG_PTR GetKernelModuleAddress(const char* name) {
 	NTSTATUS status = NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, size, &size);
 
 	while (status == STATUS_INFO_LENGTH_MISMATCH) {
-		VirtualFree(buffer, 0, MEM_RELEASE);
+		if (buffer != NULL)
+			VirtualFree(buffer, 0, MEM_RELEASE);
 
 		buffer = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 		status = NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)SystemModuleInformation, buffer, size, &size);
@@ -91,7 +92,9 @@ ULONG_PTR GetKernelModuleAddress(const char* name) {
 
 	if (!NT_SUCCESS(status))
 	{
-		VirtualFree(buffer, 0, MEM_RELEASE);
+		Printf(L"[!] NtQuerySystemInformation(SystemModuleInformation) failed: %08X\n", status);
+		if (buffer != NULL)
+			VirtualFree(buffer, 0, MEM_RELEASE);
 		return NULL;
 	}
 
@@ -720,7 +723,8 @@ WindLoadDriver(
 
 	// Enable privileges
 	CONSTEXPR CONST ULONG SE_LOAD_DRIVER_PRIVILEGE = 10UL;
-	BOOLEAN SeLoadDriverWasEnabled;
+	CONSTEXPR CONST ULONG SE_DEBUG_PRIVILEGE = 20UL;
+	BOOLEAN SeLoadDriverWasEnabled, SeDebugWasEnabled;
 	NTSTATUS Status = RtlAdjustPrivilege(SE_LOAD_DRIVER_PRIVILEGE,
 		TRUE,
 		FALSE,
@@ -730,6 +734,8 @@ WindLoadDriver(
 		Printf(L"Fatal error: failed to acquire SE_LOAD_DRIVER_PRIVILEGE. Make sure you are running as administrator.\n");
 		return Status;
 	}
+	// SE_DEBUG_PRIVILEGE is required on Win11 26xxx+ for NtQuerySystemInformation(SystemModuleInformation)
+	RtlAdjustPrivilege(SE_DEBUG_PRIVILEGE, TRUE, FALSE, &SeDebugWasEnabled);
 
 	// Expand filenames to full paths
 	Status = RtlGetFullPathName_UEx(LoaderName, MAX_PATH * sizeof(WCHAR), LoaderPath, nullptr, nullptr);
