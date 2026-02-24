@@ -176,6 +176,35 @@ static const SigPattern g_CiPatterns[] = {
 	// 15: 8B D? 4C 8D 05 - mov edx, <any 32-bit gpr>; lea r8 (mask 0xF8)
 	{ {0x8B, 0xD0, 0x4C, 0x8D, 0x05},
 	  {0xFF, 0xF8, 0xFF, 0xFF, 0xFF}, 5, 2 },
+
+	// --- Win11 25H2+ (Build 26xxx) patterns - SeCiCallbacks loaded into R9 instead of R8 ---
+	// 16: 45 33 C0 4C 8D 0D - xor r8d, r8d; lea r9, [rip+disp]
+	{ {0x45, 0x33, 0xC0, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 17: 4C 8D 05 ?? ?? ?? ?? 4C 8D 0D - lea r8, [rip+xxx]; lea r9, [rip+disp]
+	{ {0x4C, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF}, 10, 7 },
+	// 18: 48 8D 15 ?? ?? ?? ?? 4C 8D 0D - lea rdx, [rip+xxx]; lea r9, [rip+disp]
+	{ {0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF}, 10, 7 },
+	// 19: E8 ?? ?? ?? ?? 4C 8D 0D - call rel32; lea r9, [rip+disp]
+	{ {0xE8, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF}, 8, 5 },
+	// 20: 4C 8B C? 4C 8D 0D - mov r8, <64-bit gpr>; lea r9, [rip+disp]
+	{ {0x4C, 0x8B, 0xC0, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0xFF, 0xF8, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 21: 44 8B C? 4C 8D 0D - mov r8d, <32-bit gpr>; lea r9, [rip+disp]
+	{ {0x44, 0x8B, 0xC0, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0xFF, 0xF8, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 22: 33 D2 4C 8D 0D - xor edx, edx; lea r9, [rip+disp]
+	{ {0x33, 0xD2, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 5, 2 },
+	// 23: 48 8B D? 4C 8D 0D - mov rdx, <any 64-bit gpr>; lea r9, [rip+disp]
+	{ {0x48, 0x8B, 0xD0, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0xFF, 0xF8, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 24: 8B D? 4C 8D 0D - mov edx, <any 32-bit gpr>; lea r9, [rip+disp]
+	{ {0x8B, 0xD0, 0x4C, 0x8D, 0x0D},
+	  {0xFF, 0xF8, 0xFF, 0xFF, 0xFF}, 5, 2 },
 };
 
 static DWORD64 maskedPatternScan(DWORD64 base, DWORD imageSize, const SigPattern* sig)
@@ -207,25 +236,29 @@ static DWORD64 resolveLeaTarget(DWORD64 leaAddr)
 	return (leaAddr & 0xFFFFFFFF00000000) + targetLow;
 }
 
-// Fallback: scan executable sections for LEA R8 (4C 8D 05) targeting the .data section
+// Fallback: scan executable sections for any LEA reg, [rip+disp32] targeting writable data sections.
+// Newer Windows builds may load SeCiCallbacks into R8, R9, RCX, RDX, or other registers.
 static DWORD64 heuristicLeaScan(DWORD64 base, DWORD imageSize)
 {
 	IMAGE_DOS_HEADER* dosHdr = (IMAGE_DOS_HEADER*)base;
 	IMAGE_NT_HEADERS64* ntHdr = (IMAGE_NT_HEADERS64*)(base + dosHdr->e_lfanew);
 	IMAGE_SECTION_HEADER* sections = (IMAGE_SECTION_HEADER*)((char*)ntHdr + sizeof(IMAGE_NT_HEADERS64));
 
-	// Locate the .data section (where SeCiCallbacks lives)
-	DWORD64 dataStart = 0, dataSize = 0;
-	for (int s = 0; s < ntHdr->FileHeader.NumberOfSections; s++)
+	// Collect all writable data sections (SeCiCallbacks may be in .data, ALMOSTRO, PAGEDATA, etc.)
+	struct DataRange { DWORD64 start; DWORD64 size; };
+	DataRange dataRanges[16];
+	int numDataRanges = 0;
+	for (int s = 0; s < ntHdr->FileHeader.NumberOfSections && numDataRanges < 16; s++)
 	{
-		if (memcmp(sections[s].Name, ".data", 5) == 0)
+		if ((sections[s].Characteristics & IMAGE_SCN_MEM_WRITE) ||
+			memcmp(sections[s].Name, ".data", 5) == 0)
 		{
-			dataStart = base + sections[s].VirtualAddress;
-			dataSize = sections[s].Misc.VirtualSize;
-			break;
+			dataRanges[numDataRanges].start = base + sections[s].VirtualAddress;
+			dataRanges[numDataRanges].size = sections[s].Misc.VirtualSize;
+			numDataRanges++;
 		}
 	}
-	if (dataStart == 0)
+	if (numDataRanges == 0)
 		return 0;
 
 	// Search only executable sections (PAGE, .text, INIT) to reduce false positives
@@ -239,17 +272,36 @@ static DWORD64 heuristicLeaScan(DWORD64 base, DWORD imageSize)
 
 		for (unsigned int i = 0; i + 7 <= secSize; i++)
 		{
-			// Look for 4C 8D 05 (lea r8, [rip+disp32])
-			if (*(unsigned char*)(secBase + i) != 0x4C ||
-				*(unsigned char*)(secBase + i + 1) != 0x8D ||
-				*(unsigned char*)(secBase + i + 2) != 0x05)
+			unsigned char b0 = *(unsigned char*)(secBase + i);
+			unsigned char b1 = *(unsigned char*)(secBase + i + 1);
+			unsigned char b2 = *(unsigned char*)(secBase + i + 2);
+
+			// Check for REX.W LEA with RIP-relative addressing:
+			// REX prefix 0x48 (RAX-RDI) or 0x4C (R8-R15), opcode 0x8D,
+			// ModR/M with mod=00, rm=101 (RIP-relative): (modrm & 0xC7) == 0x05
+			if (b1 != 0x8D || (b0 != 0x48 && b0 != 0x4C) || (b2 & 0xC7) != 0x05)
 				continue;
 
 			DWORD64 leaAddr = secBase + i;
 			DWORD64 target = resolveLeaTarget(leaAddr);
 
-			// Target must be in .data with room for the struct (0x28 bytes for CiValidateImageHeader at +0x20)
-			if (target < dataStart || target + 0x28 > dataStart + dataSize)
+			// Target must be in a writable data section with room for the struct
+			// (0x28 bytes for CiValidateImageHeader at +0x20)
+			bool inData = false;
+			for (int d = 0; d < numDataRanges; d++)
+			{
+				if (target >= dataRanges[d].start &&
+					target + 0x28 <= dataRanges[d].start + dataRanges[d].size)
+				{
+					inData = true;
+					break;
+				}
+			}
+			if (!inData)
+				continue;
+
+			// Target should be 8-byte aligned (array of function pointers)
+			if (target & 0x7)
 				continue;
 
 			// Heuristic: next instruction should be call (E8/FF) or mov/lea (48/4C/41/44/45/89/8B/33)
@@ -322,8 +374,8 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 
 	if (seCiCallbacksInstr == 0)
 	{
-		Printf(L"[!] Could not find lea r8, [nt!SeCiCallbacks]\n");
-		Printf(L"[!] Tried %d patterns + heuristic. Your Windows build may not be supported.\n", numPatterns);
+		Printf(L"[!] Could not find lea reg, [nt!SeCiCallbacks]\n");
+		Printf(L"[!] Tried %d patterns + heuristic (R8/R9/RCX/RDX). Your Windows build may not be supported.\n", numPatterns);
 		Printf(L"[!] Please report your build number so support can be added.\n");
 		FreeLibrary(uNt);
 		return seCiCallbacks_swap{ 0, 0 };
