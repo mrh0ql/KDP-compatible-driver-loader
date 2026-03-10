@@ -1,10 +1,10 @@
 # KDP Compatible Unsigned Driver Loader 
-Kernel unsigned driver loader ,  KDP compatible,  leveraging gdrv.sys's write primitive 
+Kernel unsigned driver loader, KDP compatible, leveraging DBUtil_2_3.sys's read/write primitive (CVE-2021-21551)
 
-Tested on Windows 10 21H2 and 22H2
+Tested on Windows 10 21H2/22H2 and Windows 11 (multi-pattern SeCiCallbacks scanner)
 
 # Usage:
-**load target driver-> Loader.exe gdrv.sys driver.sys**
+**load target driver-> Loader.exe DBUtil_2_3.sys driver.sys**
 
 **unload target driver -> Loader.exe  driver.sys**
 
@@ -25,9 +25,9 @@ leverage the write primitive to replace the address of CiValidateImageHeader wit
 
   
 # Notes
-- in case loading gdrv.sys fails, its likely due to Microsoft's driver blocklist/cert expired,  just modify the code to use an alternative vulnerable driver , there are plenty of them.
+- in case loading DBUtil_2_3.sys fails, its likely due to Microsoft's driver blocklist/cert expired. You can also use other vulnerable drivers with similar IOCTLs by updating the defines in load.cpp.
 - you can also disable the driver blocklist via the following command :  reg add HKLM\SYSTEM\CurrentControlSet\Control\CI\Config /v "VulnerableDriverBlocklistEnable" /t REG_DWORD /d 0 /f      
 - whilst the implemented technique does not require a read primitive , we do use the read primitive to restore the original CiValidateImageHeader after the unsigned driver is loaded.   
 you can modify the code to not use the read primitive and it will work just fine since  SeCiCallbacks is not PatchGuard protected (EDIT : protected in Windows 11 23H2)
 
-- built on top of the core  of gdrv-loader 
+- built on top of the core of gdrv-loader (originally used Gigabyte GIO driver, now uses Dell DBUtil_2_3.sys)
